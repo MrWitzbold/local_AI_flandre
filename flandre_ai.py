@@ -12,14 +12,13 @@ Requirements:
 
 Run:
     python3 flandre_ai.py
-    → local:  http://127.0.0.1:5000
-    → LAN:    http://<your-lan-ip>:5000   (set FLANDRE_HOST=0.0.0.0 to allow)
+    → the terminal prints BOTH the local and LAN URLs
 
 Environment:
     FLANDRE_MODEL    default: qwen2.5:1.5b
     OLLAMA_URL       default: http://127.0.0.1:11434
     FLANDRE_PORT     default: 5000
-    FLANDRE_HOST     default: 127.0.0.1   (use 0.0.0.0 for LAN access)
+    FLANDRE_HOST     default: 0.0.0.0  (bind all interfaces; use 127.0.0.1 for local-only)
 
 Files created next to this script:
     memory.jsonl     — persistent rolling memory
@@ -47,9 +46,9 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 MODEL = os.getenv("FLANDRE_MODEL", "qwen2.5:1.5b")
 PORT = int(os.getenv("FLANDRE_PORT", "5000"))
 
-# Bind address. 127.0.0.1 = local only (safe default).
-# Set FLANDRE_HOST=0.0.0.0 to allow other devices on your LAN to connect.
-HOST = os.getenv("FLANDRE_HOST", "127.0.0.1")
+# Bind address. 0.0.0.0 = all interfaces (LAN-reachable, like NekoDrive).
+# Use FLANDRE_HOST=127.0.0.1 to restrict to this machine only.
+HOST = os.getenv("FLANDRE_HOST", "0.0.0.0")
 
 # Small context — enough for personality + recent talk + a summary,
 # but light enough for a 4GB laptop.
@@ -58,17 +57,17 @@ MAX_CHARS = 10_000          # when memory exceeds this, summarize it
 KEEP_RECENT = 40            # hard cap on stored messages after summary
 
 
-def get_lan_ip() -> str:
-    """Best-effort LAN IP discovery without sending any real packets."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def local_ip() -> str:
+    """Find the source IP selected for the default route, without sending data."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # Doesn't actually connect — just picks the outbound interface.
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except Exception:
+        sock.connect(("192.0.2.1", 80))  # TEST-NET address; UDP connect sends no packet.
+        value = sock.getsockname()[0]
+        return value if not value.startswith("127.") else "127.0.0.1"
+    except OSError:
         return "127.0.0.1"
     finally:
-        s.close()
+        sock.close()
 
 
 # =========================================================
@@ -897,16 +896,16 @@ def main():
     print(f"  memory   : {MEMORY_FILE}")
     print(f"  persona  : {PERSONA_FILE} (optional override)")
 
-    lan_ip = get_lan_ip()
+    ip = local_ip()
+    print(f"  Open on this laptop : http://127.0.0.1:{PORT}")
     if HOST == "0.0.0.0":
-        print(f"  open     : http://127.0.0.1:{PORT}  (this machine)")
-        if lan_ip != "127.0.0.1":
-            print(f"  lan      : http://{lan_ip}:{PORT}  (other devices on your network)")
+        if ip != "127.0.0.1":
+            print(f"  Open on your network: http://{ip}:{PORT}")
+        else:
+            print("  LAN IP not detected. Check that Wi-Fi/Ethernet is connected.")
     else:
-        print(f"  open     : http://127.0.0.1:{PORT}")
-        if lan_ip != "127.0.0.1":
-            print(f"  lan      : http://{lan_ip}:{PORT}  (set FLANDRE_HOST=0.0.0.0 to allow)")
-
+        print(f"  LAN access disabled (FLANDRE_HOST={HOST}); set FLANDRE_HOST=0.0.0.0 to allow")
+    print(f"  Listening: {HOST}:{PORT}")
     print()
 
     try:
