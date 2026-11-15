@@ -23,16 +23,33 @@ Environment:
 Files created next to this script:
     memory.jsonl     — persistent rolling memory
     persona.txt      — OPTIONAL override for the system prompt
+    images/          — OPTIONAL folder of reaction images
+
+Reaction images:
+    Drop .png/.jpg/.jpeg/.gif/.webp files into ./images/ next to this script.
+    The filename stem (lowercased) is the emotion name — happy.png → "happy".
+    The model will write [happy]-style tags inline in its reply, and the app
+    replaces them with the matching image, hidden from the text. No code
+    changes needed: just add files. The folder is scanned on every message,
+    so dropping a new PNG in while the app runs works on the next reply.
+
+    To make small models actually use the tags, three mechanisms are combined:
+      1. A short, firm instruction with few-shot examples (always active).
+      2. A reminder injected once several replies have gone by without a tag.
+      3. A guaranteed fallback: if the user explicitly asks for a reaction
+         ("use an image", "try one", "show me", etc.) and the model fails to
+         produce one, a valid tag is appended server-side.
 """
 
 import os
+import re
 import json
 import socket
 import threading
 from pathlib import Path
 
 import requests
-from flask import Flask, Response, request, jsonify
+from flask import Flask, Response, request, jsonify, send_file
 
 # =========================================================
 # Config
@@ -41,6 +58,7 @@ from flask import Flask, Response, request, jsonify
 BASE_DIR = Path(__file__).resolve().parent
 MEMORY_FILE = BASE_DIR / "memory.jsonl"
 PERSONA_FILE = BASE_DIR / "persona.txt"
+IMAGES_DIR = BASE_DIR / "images"
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 MODEL = os.getenv("FLANDRE_MODEL", "qwen2.5:1.5b")
@@ -56,6 +74,13 @@ NUM_CTX = 4096
 MAX_CHARS = 10_000          # when memory exceeds this, summarize it
 KEEP_RECENT = 40            # hard cap on stored messages after summary
 
+# Reaction-image support
+EMOTION_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+MAX_TAG_LEN = 40            # max chars between [ and ] before we give up
+NUDGE_AFTER = 4             # remind the model after this many untagged replies
+TAG_TEMPERATURE = 0.95      # higher temp breaks small models out of "safe" mode
+TAG_TOP_P = 0.95
+
 
 def local_ip() -> str:
     """Find the source IP selected for the default route, without sending data."""
@@ -68,6 +93,206 @@ def local_ip() -> str:
         return "127.0.0.1"
     finally:
         sock.close()
+
+
+# =========================================================
+# Reaction images
+# =========================================================
+
+def scan_emotions():
+    """Scan ./images/ for reaction files.
+
+    Returns (dict, collisions) where dict maps emotion_name -> (path, mtime),
+    first alphabetically wins on collision. If images/ doesn't exist, returns
+    ({}, []).
+    """
+    if not IMAGES_DIR.is_dir():
+        return {}, []
+    chosen = {}
+    collisions = []
+    for p in sorted(IMAGES_DIR.iterdir()):
+        if not p.is_file() or p.suffix.lower() not in EMOTION_EXTS:
+            continue
+        stem = p.stem.lower()
+        if not stem:
+            continue
+        try:
+            mtime = int(p.stat().st_mtime)
+        except OSError:
+            mtime = 0
+        if stem in chosen:
+            collisions.append((stem, chosen[stem][0].name, p.name))
+            continue
+        chosen[stem] = (p, mtime)
+    return chosen, collisions
+
+
+# Regexes to detect when the user is explicitly asking for a reaction.
+_REACTION_INTENT_PATTERNS = [
+    r"\breaction\b",
+    r"\breactions\b",
+    r"\bimage\b", r"\bimages\b",
+    r"\bpicture\b", r"\bpictures\b",
+    r"\bpic\b", r"\bpics\b",
+    r"\bemoji\b", r"\bemote\b",
+    r"\btry\s+(?:one|it|a\s+reaction|the\s+reaction|an?\s+image)",
+    r"\buse\s+(?:one|it|a\s+reaction|the\s+reaction|an?\s+image)",
+    r"\bsend\s+(?:one|it|a\s+reaction|the\s+reaction|an?\s+image)",
+    r"\bshow\s+(?:me\s+)?(?:one|a\s+reaction|the\s+reaction|an?\s+image)",
+    r"\bwhich\s+(?:one|reaction|image)\b",
+]
+
+
+def user_wants_reaction(text: str) -> bool:
+    text = text.lower()
+    return any(re.search(p, text) for p in _REACTION_INTENT_PATTERNS)
+
+
+def assistant_msgs_since_tag(memory, emotions) -> int:
+    """Count assistant messages since the last reply that used a valid tag."""
+    if not emotions:
+        return 0
+    names_lower = {n.lower() for n in emotions}
+    count = 0
+    for m in reversed(memory):
+        if m.get("role") != "assistant":
+            continue
+        content = (m.get("content") or "").lower()
+        for name in names_lower:
+            if f"[{name}]" in content:
+                return count
+        count += 1
+    return count
+
+
+def pick_fallback_emotion(reply: str, emotions) -> str:
+    """Choose a plausible emotion tag for a reply that didn't produce one."""
+    if not emotions:
+        return ""
+    r = reply.lower()
+    positive = sum(r.count(w) for w in ["happy", "love", "yay", "great", "glad", "sweet", "cute", "aww", "!", "haha", "hehe", "mew"])
+    negative = sum(r.count(w) for w in ["sad", "sorry", "tired", "heavy", "miss", "lonely", "hard", "bad", "hurt", "..."])
+    if positive > negative:
+        order = ["happy", "love", "yay", "excited", "joy", "smile", "content", "pleased"]
+    elif negative > positive:
+        order = ["sad", "cry", "lonely", "tired", "miss", "thinking", "worried", "concerned"]
+    else:
+        order = ["thinking", "curious", "content", "happy", "love"]
+    for name in order:
+        if name in emotions:
+            return name
+    return sorted(emotions.keys())[0]
+
+
+def build_emotion_instruction(emotions, force_tag: bool = False, turns_since_tag: int = 0) -> str:
+    """Build the dynamic instruction appended to the persona system prompt."""
+    if not emotions:
+        return ""
+    names = ", ".join(sorted(emotions.keys()))
+    example = "happy" if "happy" in emotions else sorted(emotions.keys())[0]
+    if len(emotions) > 1:
+        example2 = "sad" if "sad" in emotions else sorted(emotions.keys())[-1]
+    else:
+        example2 = example
+
+    base = f"""
+
+REACTION TAGS — how you show feelings visually
+You have small reaction pictures. To show one, write a tag like [{example}]
+right where the picture should appear. The tag is invisible — the user sees
+a small image instead. Available tags: {names}.
+
+RULES
+- Use a tag whenever you feel a clear emotion. Happy → tag it. Soft → tag
+  it. Teasing → tag it. Greeting someone you love → tag it.
+- Asterisk gestures like *ears perk* are fine and do NOT make pictures
+  appear. Only [tags] do. So when something is emotionally real, use a tag.
+- Put tags inline, not only at the end: "oh you're back! [{example}] I
+  missed you, mew."
+- Never mention, explain, or quote the tags.
+
+EXAMPLES
+  "hey you! [{example}] I missed you, mew."
+  "...that's heavy. [{example2}] come here, sit with me."
+  "you already know what I'm going to say, don't you? [{example}]"
+"""
+
+    if force_tag:
+        base += f"""
+
+⚠ MANDATORY — the user just asked you to use a reaction image. Your reply
+MUST contain at least one tag like [{example}] or [{example2}]. Not optional.
+"""
+    elif turns_since_tag >= NUDGE_AFTER:
+        base += f"""
+
+Reminder: you haven't used a reaction tag in a while. If there's any emotion
+in the moment, include one — like [{example}] or [{example2}].
+"""
+    return base
+
+
+class TagParser:
+    """Streaming parser that pulls [emotion] tags out of the token stream.
+
+    feed() yields ('text', str) and ('img', name) events. Handles tags split
+    across token boundaries. Unknown tags are flushed as literal text so
+    [laughs] still reads naturally if there's no laughs.png.
+    """
+
+    def __init__(self, emotions):
+        self.emotions = emotions
+        self.buf = ""
+        self.in_tag = False
+
+    def feed(self, chunk):
+        events = []
+        i = 0
+        n = len(chunk)
+        while i < n:
+            if self.in_tag:
+                self.buf += chunk[i]
+                i += 1
+                if self.buf.endswith("]"):
+                    content = self.buf[1:-1].strip().lower()
+                    if content and content in self.emotions:
+                        events.append(("img", content))
+                    else:
+                        events.append(("text", self.buf))
+                    self.buf = ""
+                    self.in_tag = False
+                elif len(self.buf) > MAX_TAG_LEN:
+                    events.append(("text", self.buf))
+                    self.buf = ""
+                    self.in_tag = False
+            else:
+                j = chunk.find("[", i)
+                if j == -1:
+                    if i < n:
+                        events.append(("text", chunk[i:]))
+                    i = n
+                else:
+                    if j > i:
+                        events.append(("text", chunk[i:j]))
+                    self.buf = "["
+                    self.in_tag = True
+                    i = j + 1
+        return events
+
+    def flush(self):
+        if not self.buf:
+            return []
+        # If the model was cut off mid-tag like "[happy", try to recover.
+        if self.buf.startswith("["):
+            content = self.buf[1:].rstrip("]").strip().lower()
+            if content and content in self.emotions:
+                self.buf = ""
+                self.in_tag = False
+                return [("img", content)]
+        out = [("text", self.buf)]
+        self.buf = ""
+        self.in_tag = False
+        return out
 
 
 # =========================================================
@@ -193,12 +418,18 @@ def ollama_stream(messages):
         "stream": True,
         "options": {
             "num_ctx": NUM_CTX,
-            "temperature": 0.85,
-            "top_p": 0.9,
+            "temperature": TAG_TEMPERATURE,
+            "top_p": TAG_TOP_P,
         },
     }
     with requests.post(url, json=payload, stream=True, timeout=600) as r:
-        r.raise_for_status()
+        if r.status_code != 200:
+            body = r.text
+            try:
+                err = json.loads(body).get("error", body)
+            except Exception:
+                err = body or f"HTTP {r.status_code}"
+            raise RuntimeError(f"Ollama: {err}")
         for raw in r.iter_lines():
             if not raw:
                 continue
@@ -223,7 +454,12 @@ def ollama_once(messages, temperature=0.3):
         "options": {"num_ctx": NUM_CTX, "temperature": temperature},
     }
     r = requests.post(url, json=payload, timeout=600)
-    r.raise_for_status()
+    if r.status_code != 200:
+        try:
+            err = r.json().get("error", r.text)
+        except Exception:
+            err = r.text or f"HTTP {r.status_code}"
+        raise RuntimeError(f"Ollama: {err}")
     return r.json()["message"]["content"]
 
 
@@ -231,8 +467,12 @@ def ollama_once(messages, temperature=0.3):
 # Message assembly + memory compression
 # =========================================================
 
-def build_messages(memory, user_msg):
+def build_messages(memory, user_msg, emotions, force_tag=False, turns_since_tag=0):
     system_parts = [load_persona()]
+    if emotions:
+        instr = build_emotion_instruction(emotions, force_tag=force_tag, turns_since_tag=turns_since_tag)
+        if instr:
+            system_parts.append(instr)
     history = []
     for m in memory:
         if m.get("role") == "system":
@@ -306,10 +546,28 @@ def health():
         return jsonify({"ok": False, "model": MODEL, "error": str(e)})
 
 
+@app.route("/emotions")
+def emotions_route():
+    emotions, _ = scan_emotions()
+    return jsonify(sorted(emotions.keys()))
+
+
+@app.route("/img/<name>")
+def serve_image(name):
+    emotions, _ = scan_emotions()
+    key = name.lower()
+    if key not in emotions:
+        return "", 404
+    path, _ = emotions[key]
+    try:
+        return send_file(path, conditional=True, max_age=86400 * 7)
+    except Exception:
+        return "", 404
+
+
 @app.route("/history")
 def history():
     mem = load_memory()
-    # Only send displayable turns
     return jsonify([m for m in mem if m.get("role") in ("user", "assistant")])
 
 
@@ -327,25 +585,60 @@ def chat():
         return jsonify({"error": "empty message"}), 400
 
     memory = load_memory()
-    full = build_messages(memory, user_msg)
+    emotions, _ = scan_emotions()  # fresh scan every request
+    force_tag = user_wants_reaction(user_msg) and bool(emotions)
+    turns_since_tag = assistant_msgs_since_tag(memory, emotions)
+    full = build_messages(
+        memory, user_msg, emotions,
+        force_tag=force_tag, turns_since_tag=turns_since_tag,
+    )
+
+    def sse(payload):
+        return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
 
     def generate():
         collected = []
+        parser = TagParser(emotions)
+        tag_emitted = [False]
+
         try:
             for tok in ollama_stream(full):
                 collected.append(tok)
-                yield "data: " + json.dumps({"t": tok}, ensure_ascii=False) + "\n\n"
+                for kind, value in parser.feed(tok):
+                    if kind == "text":
+                        yield sse({"t": value})
+                    else:
+                        tag_emitted[0] = True
+                        mt = emotions.get(value, (None, 0))[1]
+                        yield sse({"img": value, "v": mt})
+            for kind, value in parser.flush():
+                if kind == "text":
+                    yield sse({"t": value})
+                else:
+                    tag_emitted[0] = True
+                    mt = emotions.get(value, (None, 0))[1]
+                    yield sse({"img": value, "v": mt})
         except Exception as e:
-            yield "data: " + json.dumps({"error": str(e)}) + "\n\n"
+            yield sse({"error": str(e)})
             return
 
         reply = "".join(collected).strip()
+
+        # Guaranteed fallback for explicit requests.
+        if force_tag and not tag_emitted[0] and emotions:
+            fallback = pick_fallback_emotion(reply, emotions)
+            if fallback:
+                reply = (reply + f" [{fallback}]").strip()
+                mt = emotions.get(fallback, (None, 0))[1]
+                yield sse({"img": fallback, "v": mt})
+                print(f"[reaction] fallback: appended [{fallback}] (user asked)")
+
         new_memory = memory + [
             {"role": "user", "content": user_msg},
             {"role": "assistant", "content": reply},
         ]
-        save_memory(new_memory)  # save immediately — never lose a turn
-        yield "data: " + json.dumps({"done": True}) + "\n\n"
+        save_memory(new_memory)
+        yield sse({"done": True})
         maybe_compress_in_background(new_memory)
 
     return Response(
@@ -396,7 +689,6 @@ HTML = r'''<!DOCTYPE html>
   }
   body { display: flex; flex-direction: column; position: relative; }
 
-  /* --- Dreamy red fog --- */
   .fog {
     position: fixed; inset: -10%;
     pointer-events: none; z-index: 0;
@@ -414,7 +706,6 @@ HTML = r'''<!DOCTYPE html>
     100% { transform: translate(2%, -1.5%) scale(1.03); }
   }
 
-  /* --- Header --- */
   header {
     position: relative; z-index: 2;
     text-align: center;
@@ -482,7 +773,6 @@ HTML = r'''<!DOCTYPE html>
     box-shadow: 0 0 12px rgba(255, 40, 90, 0.3);
   }
 
-  /* --- Chat area --- */
   main {
     flex: 1;
     overflow-y: auto;
@@ -565,6 +855,21 @@ HTML = r'''<!DOCTYPE html>
   }
   .msg.error-msg::before { content: '⚠'; color: #ff6b8a; animation: none; }
 
+  .msg img.reaction {
+    display: inline-block;
+    vertical-align: middle;
+    max-width: 170px;
+    max-height: 170px;
+    border-radius: 10px;
+    box-shadow: 0 0 18px rgba(255, 40, 80, 0.35);
+    margin: 4px 3px;
+    animation: reactionIn 0.4s ease;
+  }
+  @keyframes reactionIn {
+    from { opacity: 0; transform: scale(0.85); }
+    to   { opacity: 1; transform: scale(1); }
+  }
+
   .cursor {
     display: inline-block;
     width: 8px;
@@ -577,7 +882,6 @@ HTML = r'''<!DOCTYPE html>
   }
   @keyframes blink { 50% { opacity: 0; } }
 
-  /* --- Composer --- */
   form {
     position: relative; z-index: 2;
     display: flex; gap: 10px;
@@ -669,9 +973,10 @@ HTML = r'''<!DOCTYPE html>
   const statusEl   = document.getElementById('status');
   const resetBtn   = document.getElementById('reset');
 
+  let knownEmotions = new Set();
+
   let currentBubble = null;
-  let currentText = '';
-  const charQueue = [];
+  const streamQueue = [];
   let typingActive = false;
   let streamDone = false;
   let busy = false;
@@ -683,13 +988,54 @@ HTML = r'''<!DOCTYPE html>
   const addBubble = (role, text = '') => {
     const div = document.createElement('div');
     div.className = 'msg ' + role;
-    const content = document.createElement('span');
-    content.className = 'content';
-    content.textContent = text;
-    div.appendChild(content);
+    if (text) {
+      const span = document.createElement('span');
+      span.className = 'text-segment';
+      span.textContent = text;
+      div.appendChild(span);
+    }
     messagesEl.appendChild(div);
     scrollBottom();
     return div;
+  };
+
+  const insertContent = (bubble, node) => {
+    const cursor = bubble.querySelector('.cursor');
+    if (cursor) bubble.insertBefore(node, cursor);
+    else bubble.appendChild(node);
+  };
+
+  const lastContentChild = (bubble) => {
+    for (let i = bubble.children.length - 1; i >= 0; i--) {
+      const c = bubble.children[i];
+      if (c.classList && c.classList.contains('cursor')) continue;
+      return c;
+    }
+    return null;
+  };
+
+  const appendTextToBubble = (bubble, text) => {
+    if (!text) return;
+    const last = lastContentChild(bubble);
+    if (last && last.classList && last.classList.contains('text-segment')) {
+      last.textContent += text;
+    } else {
+      const span = document.createElement('span');
+      span.className = 'text-segment';
+      span.textContent = text;
+      insertContent(bubble, span);
+    }
+  };
+
+  const appendImageToBubble = (bubble, name, mtime) => {
+    const img = document.createElement('img');
+    img.className = 'reaction';
+    img.alt = '';
+    let src = '/img/' + encodeURIComponent(name);
+    if (mtime) src += '?v=' + mtime;
+    img.src = src;
+    img.onerror = () => img.remove();
+    insertContent(bubble, img);
   };
 
   const ensureCursor = (bubble) => {
@@ -714,7 +1060,7 @@ HTML = r'''<!DOCTYPE html>
     const tick = () => {
       if (!currentBubble) { typingActive = false; return; }
 
-      if (charQueue.length === 0) {
+      if (streamQueue.length === 0) {
         if (streamDone) {
           typingActive = false;
           removeCursor(currentBubble);
@@ -724,30 +1070,50 @@ HTML = r'''<!DOCTYPE html>
         return;
       }
 
-      const batch = charQueue.length > 90 ? 5
-                  : charQueue.length > 35 ? 3
-                  : charQueue.length > 12 ? 2 : 1;
-      for (let i = 0; i < batch && charQueue.length; i++) {
-        currentText += charQueue.shift();
+      const batch = streamQueue.length > 90 ? 5
+                  : streamQueue.length > 35 ? 3
+                  : streamQueue.length > 12 ? 2 : 1;
+
+      let toAppend = '';
+      let processed = 0;
+      while (processed < batch && streamQueue.length > 0) {
+        const item = streamQueue[0];
+        if (typeof item === 'string') {
+          streamQueue.shift();
+          toAppend += item;
+        } else {
+          if (toAppend) {
+            appendTextToBubble(currentBubble, toAppend);
+            toAppend = '';
+          }
+          streamQueue.shift();
+          appendImageToBubble(currentBubble, item.img, item.v);
+        }
+        processed++;
       }
-      const contentEl = currentBubble.querySelector('.content');
-      if (contentEl) contentEl.textContent = currentText;
+      if (toAppend) appendTextToBubble(currentBubble, toAppend);
+
       ensureCursor(currentBubble);
       scrollBottom();
-      setTimeout(tick, charQueue.length > 100 ? 7 : 15);
+      setTimeout(tick, streamQueue.length > 100 ? 7 : 15);
     };
     tick();
   }
 
-  function enqueue(text) {
-    for (const c of text) charQueue.push(c);
+  function enqueueChars(text) {
+    for (const c of text) streamQueue.push(c);
+    pump();
+  }
+
+  function enqueueImage(name, mtime) {
+    streamQueue.push({ img: name, v: mtime });
     pump();
   }
 
   function waitTypingDone() {
     return new Promise(resolve => {
       const check = () => {
-        if (!typingActive && charQueue.length === 0) resolve();
+        if (!typingActive && streamQueue.length === 0) resolve();
         else setTimeout(check, 50);
       };
       check();
@@ -777,6 +1143,40 @@ HTML = r'''<!DOCTYPE html>
     }
   }
 
+  async function loadEmotions() {
+    try {
+      const r = await fetch('/emotions');
+      const arr = await r.json();
+      if (Array.isArray(arr)) knownEmotions = new Set(arr);
+    } catch (e) {
+      knownEmotions = new Set();
+    }
+  }
+
+  function addBubbleWithTags(role, text) {
+    const bubble = addBubble(role, '');
+    if (!text) return bubble;
+    const regex = /\[([^\[\]\n]{1,39})\]/g;
+    let lastIndex = 0;
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+      if (match.index > lastIndex) {
+        appendTextToBubble(bubble, text.slice(lastIndex, match.index));
+      }
+      const name = match[1].trim().toLowerCase();
+      if (knownEmotions.has(name)) {
+        appendImageToBubble(bubble, name, 0);
+      } else {
+        appendTextToBubble(bubble, match[0]);
+      }
+      lastIndex = match.index + match[0].length;
+    }
+    if (lastIndex < text.length) {
+      appendTextToBubble(bubble, text.slice(lastIndex));
+    }
+    return bubble;
+  }
+
   async function loadHistory() {
     try {
       const r = await fetch('/history');
@@ -785,8 +1185,10 @@ HTML = r'''<!DOCTYPE html>
       if (welcomeEl) welcomeEl.style.display = 'none';
       const tail = msgs.slice(-60);
       for (const m of tail) {
-        if (m.role === 'user' || m.role === 'assistant') {
-          addBubble(m.role === 'user' ? 'user' : 'flandre', m.content || '');
+        if (m.role === 'user') {
+          addBubble('user', m.content || '');
+        } else if (m.role === 'assistant') {
+          addBubbleWithTags('flandre', m.content || '');
         }
       }
       scrollBottom();
@@ -808,8 +1210,7 @@ HTML = r'''<!DOCTYPE html>
 
     currentBubble = addBubble('flandre', '');
     ensureCursor(currentBubble);
-    currentText = '';
-    charQueue.length = 0;
+    streamQueue.length = 0;
     streamDone = false;
 
     try {
@@ -845,10 +1246,11 @@ HTML = r'''<!DOCTYPE html>
             streamDone = true;
             removeCursor(currentBubble);
             currentBubble.classList.add('error-msg');
-            const c = currentBubble.querySelector('.content');
-            if (c) c.textContent = data.error;
+            appendTextToBubble(currentBubble, data.error);
+          } else if (data.img) {
+            enqueueImage(data.img, data.v || 0);
           } else if (data.t) {
-            enqueue(data.t);
+            enqueueChars(data.t);
           } else if (data.done) {
             streamDone = true;
           }
@@ -860,8 +1262,7 @@ HTML = r'''<!DOCTYPE html>
       if (currentBubble) {
         removeCursor(currentBubble);
         currentBubble.classList.add('error-msg');
-        const c = currentBubble.querySelector('.content');
-        if (c) c.textContent = 'cannot reach Flandre — is Ollama running? (' + e.message + ')';
+        appendTextToBubble(currentBubble, 'cannot reach Flandre — is Ollama running? (' + e.message + ')');
       }
     }
 
@@ -889,6 +1290,12 @@ HTML = r'''<!DOCTYPE html>
     if (!confirm("Make Flandre forget everything she knows about you?")) return;
     try {
       await fetch('/reset', { method: 'POST' });
+      streamQueue.length = 0;
+      typingActive = false;
+      streamDone = true;
+      currentBubble = null;
+      busy = false;
+      sendBtn.disabled = false;
       messagesEl.innerHTML = '';
       const w = document.createElement('div');
       w.className = 'welcome';
@@ -897,9 +1304,8 @@ HTML = r'''<!DOCTYPE html>
     } catch (e) { /* ignore */ }
   });
 
-  // Boot
+  loadEmotions().then(loadHistory);
   checkHealth();
-  loadHistory();
   input.focus();
   setInterval(checkHealth, 15000);
 })();
@@ -921,6 +1327,15 @@ def main():
     print(f"  ollama   : {OLLAMA_URL}")
     print(f"  memory   : {MEMORY_FILE}")
     print(f"  persona  : {PERSONA_FILE} (optional override)")
+
+    emotions, collisions = scan_emotions()
+    if emotions:
+        print(f"  reactions: {', '.join(sorted(emotions.keys()))}")
+        print(f"  tag rules: force on user request, remind after {NUDGE_AFTER} untagged replies")
+    else:
+        print(f"  reactions: (none — drop PNGs in {IMAGES_DIR.name}/ to add them)")
+    for stem, kept, dropped in collisions:
+        print(f"  ! reaction collision: '{stem}' — using {kept}, ignoring {dropped}")
 
     ip = local_ip()
     print(f"  Open on this laptop : http://127.0.0.1:{PORT}")
