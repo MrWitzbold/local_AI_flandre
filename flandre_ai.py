@@ -11,13 +11,15 @@ Requirements:
     # ollama pull qwen2.5:0.5b
 
 Run:
-    python main.py
-    → open http://127.0.0.1:5000
+    python3 flandre_ai.py
+    → local:  http://127.0.0.1:5000
+    → LAN:    http://<your-lan-ip>:5000   (set FLANDRE_HOST=0.0.0.0 to allow)
 
 Environment:
     FLANDRE_MODEL    default: qwen2.5:1.5b
     OLLAMA_URL       default: http://127.0.0.1:11434
     FLANDRE_PORT     default: 5000
+    FLANDRE_HOST     default: 127.0.0.1   (use 0.0.0.0 for LAN access)
 
 Files created next to this script:
     memory.jsonl     — persistent rolling memory
@@ -26,6 +28,7 @@ Files created next to this script:
 
 import os
 import json
+import socket
 import threading
 from pathlib import Path
 
@@ -44,11 +47,29 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 MODEL = os.getenv("FLANDRE_MODEL", "qwen2.5:1.5b")
 PORT = int(os.getenv("FLANDRE_PORT", "5000"))
 
+# Bind address. 127.0.0.1 = local only (safe default).
+# Set FLANDRE_HOST=0.0.0.0 to allow other devices on your LAN to connect.
+HOST = os.getenv("FLANDRE_HOST", "127.0.0.1")
+
 # Small context — enough for personality + recent talk + a summary,
 # but light enough for a 4GB laptop.
 NUM_CTX = 4096
 MAX_CHARS = 10_000          # when memory exceeds this, summarize it
 KEEP_RECENT = 40            # hard cap on stored messages after summary
+
+
+def get_lan_ip() -> str:
+    """Best-effort LAN IP discovery without sending any real packets."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Doesn't actually connect — just picks the outbound interface.
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
 
 # =========================================================
 # Persona
@@ -875,8 +896,19 @@ def main():
     print(f"  ollama   : {OLLAMA_URL}")
     print(f"  memory   : {MEMORY_FILE}")
     print(f"  persona  : {PERSONA_FILE} (optional override)")
-    print(f"  open     : http://127.0.0.1:{PORT}")
+
+    lan_ip = get_lan_ip()
+    if HOST == "0.0.0.0":
+        print(f"  open     : http://127.0.0.1:{PORT}  (this machine)")
+        if lan_ip != "127.0.0.1":
+            print(f"  lan      : http://{lan_ip}:{PORT}  (other devices on your network)")
+    else:
+        print(f"  open     : http://127.0.0.1:{PORT}")
+        if lan_ip != "127.0.0.1":
+            print(f"  lan      : http://{lan_ip}:{PORT}  (set FLANDRE_HOST=0.0.0.0 to allow)")
+
     print()
+
     try:
         r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=2)
         names = [m.get("name", "") for m in r.json().get("models", [])]
@@ -887,7 +919,7 @@ def main():
         print("  ! Ollama not reachable. Is it running? (ollama serve)")
     print()
 
-    app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)
+    app.run(host=HOST, port=PORT, debug=False, threaded=True)
 
 
 if __name__ == "__main__":
